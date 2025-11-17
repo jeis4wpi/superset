@@ -99,6 +99,9 @@ venv
 # PyCharm
 .run
 
+# Emacs
+*~
+
 # Test data
 celery_results.sqlite
 celerybeat-schedule
