@@ -120,6 +120,34 @@ logger = logging.getLogger(__name__)
 VIRTUAL_TABLE_ALIAS = "virtual_table"
 SERIES_LIMIT_SUBQ_ALIAS = "series_limit"
 
+# Keys used to filter QueryObjectDict for get_sqla_query parameters
+SQLA_QUERY_KEYS = {
+    "apply_fetch_values_predicate",
+    "columns",
+    "extras",
+    "filter",
+    "from_dttm",
+    "granularity",
+    "groupby",
+    "inner_from_dttm",
+    "inner_to_dttm",
+    "is_rowcount",
+    "is_timeseries",
+    "metrics",
+    "orderby",
+    "order_desc",
+    "to_dttm",
+    "series_columns",
+    "series_limit",
+    "series_limit_metric",
+    "group_others_when_limit_reached",
+    "row_limit",
+    "row_offset",
+    "timeseries_limit",
+    "timeseries_limit_metric",
+    "time_shift",
+}
+
 
 def validate_adhoc_subquery(
     sql: str,
@@ -824,7 +852,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
     def columns(self) -> list[Any]:
         raise NotImplementedError()
 
-    def get_extra_cache_keys(self, query_obj: dict[str, Any]) -> list[Hashable]:
+    def get_extra_cache_keys(self, query_obj: QueryObjectDict) -> list[Hashable]:
         raise NotImplementedError()
 
     def get_template_processor(self, **kwargs: Any) -> BaseTemplateProcessor:
@@ -974,7 +1002,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         query_obj: QueryObjectDict,
         mutate: bool = True,
     ) -> QueryStringExtended:
-        sqlaq = self.get_sqla_query(**query_obj)
+        # Filter out keys that aren't parameters to get_sqla_query
+        filtered_query_obj = {
+            k: v for k, v in query_obj.items() if k in SQLA_QUERY_KEYS
+        }
+        sqlaq = self.get_sqla_query(**cast(Any, filtered_query_obj))
         sql = self.database.compile_sqla_query(
             sqlaq.sqla_query,
             catalog=self.catalog,
@@ -2042,6 +2074,11 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             metrics_exprs = []
 
         time_filters = []
+
+        # Process FROM clause early to populate removed_filters from virtual dataset
+        # templates before we decide whether to add time filters
+        tbl, cte = self.get_from_clause(template_processor)
+
         if granularity:
             if granularity not in columns_by_name or not dttm_col:
                 raise QueryObjectValidationError(
@@ -2064,6 +2101,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                 self.always_filter_main_dttm
                 and self.main_dttm_col in self.dttm_cols
                 and self.main_dttm_col != dttm_col.column_name
+                and self.main_dttm_col not in removed_filters
             ):
                 time_filters.append(
                     self.get_time_filter(
@@ -2074,13 +2112,21 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     )
                 )
 
-            time_filter_column = self.get_time_filter(
-                time_col=dttm_col,
-                start_dttm=from_dttm,
-                end_dttm=to_dttm,
-                template_processor=template_processor,
+            # Check if time filter should be skipped because it was handled in template.
+            # Check both the actual column name and __timestamp alias
+            should_skip_time_filter = (
+                dttm_col.column_name in removed_filters
+                or utils.DTTM_ALIAS in removed_filters
             )
-            time_filters.append(time_filter_column)
+
+            if not should_skip_time_filter:
+                time_filter_column = self.get_time_filter(
+                    time_col=dttm_col,
+                    start_dttm=from_dttm,
+                    end_dttm=to_dttm,
+                    template_processor=template_processor,
+                )
+                time_filters.append(time_filter_column)
 
         # Always remove duplicates by column name, as sometimes `metrics_exprs`
         # can have the same name as a groupby column (e.g. when users use
@@ -2098,8 +2144,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
             select_exprs = remove_duplicates(select_exprs + orderby_exprs)
 
         qry = sa.select(select_exprs)
-
-        tbl, cte = self.get_from_clause(template_processor)
 
         if groupby_all_columns:
             qry = qry.group_by(*groupby_all_columns.values())
@@ -2145,7 +2189,17 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     is_metric_filter = True
             filter_grain = flt.get("grain")
 
-            if get_column_name(flt_col) in removed_filters:
+            # Check if this filter should be skipped because it was handled in
+            # template. Special handling for __timestamp alias: check both the
+            # alias and the actual column name
+            filter_col_name = get_column_name(flt_col)
+            should_skip_filter = filter_col_name in removed_filters
+            if not should_skip_filter and flt_col == utils.DTTM_ALIAS and col_obj:
+                # For __timestamp, also check if the actual datetime column was
+                # removed
+                should_skip_filter = col_obj.column_name in removed_filters
+
+            if should_skip_filter:
                 # Skip generating SQLA filter when the jinja template handles it.
                 continue
 
@@ -2491,7 +2545,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     ]
 
                 # run prequery to get top groups
-                prequery_obj = {
+                prequery_obj: QueryObjectDict = {
                     "is_timeseries": False,
                     "row_limit": series_limit,
                     "metrics": metrics,
@@ -2499,7 +2553,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     "groupby": groupby,
                     "from_dttm": inner_from_dttm or from_dttm,
                     "to_dttm": inner_to_dttm or to_dttm,
-                    "filter": filter,
+                    "filter": filter or [],
                     "orderby": orderby,
                     "extras": extras,
                     "columns": get_non_base_axis_columns(columns),
