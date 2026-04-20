@@ -26,6 +26,7 @@ import {
   useState,
 } from 'react';
 
+import { t } from '@apache-superset/core/translation';
 import {
   ChartDataResponseResult,
   Behavior,
@@ -36,22 +37,26 @@ import {
   JsonObject,
   QueryFormData,
   SuperChart,
-  t,
   ClientErrorObject,
   getClientErrorObject,
+  isChartCustomization,
 } from '@superset-ui/core';
-import { styled } from '@apache-superset/core/ui';
+import { styled } from '@apache-superset/core/theme';
 import { useDispatch, useSelector } from 'react-redux';
 import { isEqual, isEqualWith } from 'lodash';
 import { getChartDataRequest } from 'src/components/Chart/chartAction';
 import { ErrorAlert, ErrorMessageWithStackTrace } from 'src/components';
-import { Loading, Constants } from '@superset-ui/core/components';
+import { Loading, Constants, Flex } from '@superset-ui/core/components';
 import { waitForAsyncData } from 'src/middleware/asyncEvent';
 import { FilterBarOrientation, RootState } from 'src/dashboard/types';
 import {
   onFiltersRefreshSuccess,
   setDirectPathToChild,
 } from 'src/dashboard/actions/dashboardState';
+import {
+  setHoveredChartCustomization,
+  unsetHoveredChartCustomization,
+} from 'src/dashboard/actions/nativeFilters';
 import { RESPONSIVE_WIDTH } from 'src/filters/components/common';
 import { dispatchHoverAction, dispatchFocusAction } from './utils';
 import { FilterControlProps } from './types';
@@ -78,7 +83,6 @@ const StyledDiv = styled.div<{
 `;
 
 const queriesDataPlaceholder = [{ data: [{}] }];
-const behaviors = [Behavior.NativeFilter];
 
 const useShouldFilterRefresh = () => {
   const isDashboardRefreshing = useSelector<RootState, boolean>(
@@ -92,7 +96,9 @@ const useShouldFilterRefresh = () => {
   return !isDashboardRefreshing && isFilterRefreshing;
 };
 
-const FilterValue: FC<FilterControlProps> = ({
+export type FilterValueProps = FilterControlProps;
+
+const FilterValue: FC<FilterValueProps> = ({
   dataMaskSelected,
   filter,
   onFilterSelectionChange,
@@ -106,11 +112,24 @@ const FilterValue: FC<FilterControlProps> = ({
   clearAllTrigger,
   onClearAllComplete,
 }) => {
-  const { id, targets, filterType, adhoc_filters, time_range } = filter;
+  const { id, targets, filterType } = filter;
+  const isCustomization = isChartCustomization(filter);
+  const adhocFilters = isCustomization ? undefined : filter.adhoc_filters;
+  const timeRange = isCustomization ? undefined : filter.time_range;
+  const granularitySqla = isCustomization ? undefined : filter.granularity_sqla;
   const metadata = getChartMetadataRegistry().get(filterType);
   const dependencies = useFilterDependencies(id, dataMaskSelected);
   const shouldRefresh = useShouldFilterRefresh();
+
+  const behaviors = useMemo(
+    () => [
+      isCustomization ? Behavior.ChartCustomization : Behavior.NativeFilter,
+    ],
+    [isCustomization],
+  );
   const [state, setState] = useState<ChartDataResponseResult[]>([]);
+  const hasDeps = Boolean(filter.cascadeParentIds?.length);
+  const [hasDepsFilterValue, setHasDepsFilterValue] = useState(hasDeps);
   const dashboardId = useSelector<RootState, number>(
     state => state.dashboardInfo.id,
   );
@@ -122,12 +141,12 @@ const FilterValue: FC<FilterControlProps> = ({
   const [ownState, setOwnState] = useState<JsonObject>({});
   const [inViewFirstTime, setInViewFirstTime] = useState(inView);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [target] = targets;
+  const [target] = targets || [];
   const {
     datasetId,
     column = {},
-  }: Partial<{ datasetId: number; column: { name?: string } }> = target;
-  const { name: groupby } = column;
+  }: Partial<{ datasetId: number; column: { name?: string } }> = target || {};
+  const groupby = column?.name;
   const hasDataSource = !!datasetId;
   const [isLoading, setIsLoading] = useState<boolean>(hasDataSource);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -144,6 +163,10 @@ const FilterValue: FC<FilterControlProps> = ({
   }, [dispatch, shouldRefresh]);
 
   useEffect(() => {
+    setHasDepsFilterValue(hasDeps);
+  }, [hasDeps]);
+
+  useEffect(() => {
     if (!inViewFirstTime && inView) {
       setInViewFirstTime(true);
     }
@@ -158,37 +181,41 @@ const FilterValue: FC<FilterControlProps> = ({
       datasetId,
       dependencies,
       groupby,
-      adhoc_filters,
-      time_range,
+      adhoc_filters: adhocFilters,
+      time_range: timeRange,
+      granularity_sqla: granularitySqla,
       dashboardId,
     });
     const filterOwnState = filter.dataMask?.ownState || {};
-    if (filter?.cascadeParentIds?.length) {
+    if ((filter.cascadeParentIds ?? []).length) {
       // Prevent unnecessary backend requests by validating parent filter selections first
 
       let selectedParentFilterValueCounts = 0;
-
-      filter?.cascadeParentIds?.forEach(pId => {
+      let isTimeRangeSelected = false;
+      (filter.cascadeParentIds ?? []).forEach(pId => {
         const extraFormData = dataMaskSelected?.[pId]?.extraFormData;
         if (extraFormData?.filters?.length) {
           selectedParentFilterValueCounts += extraFormData.filters.length;
-        } else if (extraFormData?.time_range) {
-          selectedParentFilterValueCounts += 1;
+        }
+        if (extraFormData?.time_range) {
+          isTimeRangeSelected = true;
         }
       });
 
       // check if all parent filters with defaults have a value selected
 
-      let depsCount = dependencies.filters?.length ?? 0;
+      const depsCount = dependencies.filters?.length ?? 0;
+      const hasTimeRangeDeps = Boolean(dependencies?.time_range);
 
-      if (dependencies?.time_range) {
-        depsCount += 1;
-      }
-      if (selectedParentFilterValueCounts !== depsCount) {
+      if (
+        selectedParentFilterValueCounts !== depsCount ||
+        (hasTimeRangeDeps && !isTimeRangeSelected)
+      ) {
         // child filter should not request backend until it
         // has all the required information from parent filters
         return;
       }
+      setHasDepsFilterValue(false);
     }
 
     // TODO: We should try to improve our useEffect hooks to depend more on
@@ -220,10 +247,10 @@ const FilterValue: FC<FilterControlProps> = ({
             // deal with getChartDataRequest transforming the response data
             const result = 'result' in json ? json.result[0] : json;
             if (response.status === 200) {
-              setState([result]);
+              setState([result as ChartDataResponseResult]);
               handleFilterLoadFinish();
             } else if (response.status === 202) {
-              waitForAsyncData(result)
+              waitForAsyncData(result as Parameters<typeof waitForAsyncData>[0])
                 .then((asyncResult: ChartDataResponseResult[]) => {
                   setState(asyncResult);
                   handleFilterLoadFinish();
@@ -240,7 +267,7 @@ const FilterValue: FC<FilterControlProps> = ({
               );
             }
           } else {
-            setState(json.result);
+            setState(json.result as ChartDataResponseResult[]);
             setError(undefined);
             handleFilterLoadFinish();
           }
@@ -263,6 +290,7 @@ const FilterValue: FC<FilterControlProps> = ({
     isRefreshing,
     shouldRefresh,
     dataMaskSelected,
+    setHasDepsFilterValue,
   ]);
 
   useEffect(() => {
@@ -282,27 +310,39 @@ const FilterValue: FC<FilterControlProps> = ({
   );
 
   const setFocusedFilter = useCallback(() => {
-    // don't highlight charts in scope if filter was focused programmatically
+    if (isCustomization) {
+      return;
+    }
     if (outlinedFilterId !== id) {
       dispatchFocusAction(dispatch, id);
     }
-  }, [dispatch, id, outlinedFilterId]);
+  }, [dispatch, id, outlinedFilterId, isCustomization]);
 
   const unsetFocusedFilter = useCallback(() => {
+    if (isCustomization) {
+      return;
+    }
     dispatchFocusAction(dispatch);
     if (outlinedFilterId === id) {
       dispatch(setDirectPathToChild([]));
     }
-  }, [dispatch, id, outlinedFilterId]);
+  }, [dispatch, id, outlinedFilterId, isCustomization]);
 
-  const setHoveredFilter = useCallback(
-    () => dispatchHoverAction(dispatch, id),
-    [dispatch, id],
-  );
-  const unsetHoveredFilter = useCallback(
-    () => dispatchHoverAction(dispatch),
-    [dispatch],
-  );
+  const setHoveredFilter = useCallback(() => {
+    if (isCustomization) {
+      dispatch(setHoveredChartCustomization(id));
+    } else {
+      dispatchHoverAction(dispatch, id);
+    }
+  }, [dispatch, id, isCustomization]);
+
+  const unsetHoveredFilter = useCallback(() => {
+    if (isCustomization) {
+      dispatch(unsetHoveredChartCustomization());
+    } else {
+      dispatchHoverAction(dispatch);
+    }
+  }, [dispatch, isCustomization]);
 
   const hooks = useMemo(
     () => ({
@@ -367,7 +407,12 @@ const FilterValue: FC<FilterControlProps> = ({
       overflow={overflow}
     >
       {isLoading ? (
-        <Loading position="inline-centered" size="s" muted />
+        <Flex align="center">
+          <Loading position="inline" size="s" muted />
+          {hasDepsFilterValue
+            ? t('Awaiting filter selection')
+            : t('Loading filter values')}
+        </Flex>
       ) : (
         <SuperChart
           height={HEIGHT}
